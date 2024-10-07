@@ -8,7 +8,7 @@ Flask-Cors==5.0.0
 numpy==2.1.1
 opencv-python-headless==4.10.0.84 
 Pillow==10.4.0
-torch==1.5.0+cpu
+torch==1.11.0+cpu
 torchvision==0.6.0+cpu
 open_clip_torch==2.26.1
 sentence-transformers==3.1.1
