@@ -4,11 +4,13 @@ import open_clip
 from sentence_transformers import util
 from PIL import Image
 import cv2
+import easyocr
+
 # Cihazı belirle
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # OpenCLIP modelini ve ön işleme adımlarını oluştur
-model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16-plus-240', pretrained="laion400m_e32")
+model, _, preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained="laion2b_s32b_b82k")
 model.to(device)
 
 def imageEncoder(img):
@@ -74,53 +76,112 @@ def to_binary_vector(vec, threshold=0.5):
     return (vec > threshold).float()
 
 def generateScore(test_img, encoded_images):
-    # Test resmini encodela
     img1 = imageEncoder(test_img)
 
-    best_score = None
+    best_combined_score = -float('inf') # Başlangıç değeri
     best_logo = None
-    best_method = None  # En yüksek skoru veren yöntemi tutacak değişken
 
-    # Encode edilmiş logo resimleri ile karşılaştırma yap
     for logo, encoded_logo in encoded_images.items():
-        # Kozinüs benzerliğini hesapla
+        # 1. Metrikleri Hesapla
         cos_scores = util.pytorch_cos_sim(img1, encoded_logo)
         cos_score = float(cos_scores[0][0])
 
-        # Öklidyen mesafeyi hesapla (negatif değer, benzerliği artırır)
         euclidean_dist = euclidean_distance(img1, encoded_logo)
-
-        # Minkowski mesafesini hesapla (p=3 örneği)
         minkowski_dist = minkowski_distance(img1, encoded_logo, p=3)
+        pearson_corr = pearson_correlation(img1, encoded_logo)
 
-        # İkili vektörleri oluştur
+        # Jaccard için ikili vektör oluşturma
         binary_img1 = to_binary_vector(img1)
         binary_encoded_logo = to_binary_vector(encoded_logo)
-
-        # Jaccard benzerliğini hesapla
         intersection = (binary_img1 * binary_encoded_logo).sum().item()
         union = (binary_img1 + binary_encoded_logo).sum().item()
         jaccard_score = intersection / union if union != 0 else 0
 
-        # Pearson korelasyonunu hesapla
-        pearson_corr = pearson_correlation(img1, encoded_logo)
+        # 2. Skorları Normalize Et (0-1 Aralığına)
+        # Cosine ve Pearson zaten -1 ile 1 arasında, 0-1'e taşımak için (x + 1) / 2
+        norm_cos_score = (cos_score + 1) / 2
+        norm_pearson_corr = (pearson_corr + 1) / 2
+        # Jaccard zaten 0-1 arasında
 
-        # Benzerlik skorlarını birleştir
-        combined_score = {
-            'cosine_similarity': cos_score,
-            'euclidean_distance': -euclidean_dist,  # Negatif
-            'minkowski_distance': -minkowski_dist,  # Negatif
-            'jaccard_similarity': jaccard_score,
-            'pearson_correlation': pearson_corr
+        # Mesafe ölçütlerini benzerliğe çevir
+        # Mesafenin 0 olduğu durumda sonsuz benzerlik verir,
+        # bu nedenle 1 / (1 + mesafe) formülü daha stabildir.
+        # Maksimum olası mesafeyi bilmediğimiz için bu tür bir normalizasyon kullanıyoruz.
+        norm_euclidean_score = 1 / (1 + euclidean_dist)
+        norm_minkowski_score = 1 / (1 + minkowski_dist)
+
+        weights = {
+            'cosine': 0.1,
+            'jaccard': 0.1,
+            'pearson': 0.8
         }
 
-        # En yüksek benzerliği kontrol et
-        current_best = max(combined_score.values())
-        current_best_method = max(combined_score, key=combined_score.get)  # En yüksek skoru veren yöntem
+        combined_score = (
+            weights['cosine'] * norm_cos_score +
+            weights['jaccard'] * jaccard_score +
+            weights['pearson'] * norm_pearson_corr
+        )
 
-        if best_score is None or current_best > best_score:
-            best_score = current_best
+        if combined_score > best_combined_score:
+            best_combined_score = combined_score
             best_logo = logo
-            best_method = current_best_method  # En iyi yöntemi güncelle
 
-    return best_logo, best_score, best_method  # En iyi yöntemi döndür
+    return best_logo, best_combined_score, "combined_metrics"
+
+def detect_column_code_and_color(img):
+
+    reader = easyocr.Reader(['en', 'tr'], gpu=False)
+    ocr_results = reader.readtext(img)
+    code = None
+    color_name = None
+
+    for bbox, text, conf in ocr_results:
+        if len(text) <= 5 and any(c.isalpha() for c in text) and any(c.isdigit() for c in text):
+            code = text
+            # bbox: [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+            x_coords = [point[0] for point in bbox]
+            y_coords = [point[1] for point in bbox]
+            x_min, x_max = int(min(x_coords)), int(max(x_coords))
+            y_min, y_max = int(min(y_coords)), int(max(y_coords))
+
+            # Kutuyu biraz büyüt (çevresini de al)
+            pad_x = int((x_max - x_min) * 0.2)
+            pad_y = int((y_max - y_min) * 0.2)
+            x_min = max(0, x_min - pad_x)
+            x_max = min(img.shape[1], x_max + pad_x)
+            y_min = max(0, y_min - pad_y)
+            y_max = min(img.shape[0], y_max + pad_y)
+
+            roi = img[y_min:y_max, x_min:x_max]
+            if roi.size > 0:
+                avg_color = roi.mean(axis=(0, 1))  # BGR
+                color_name = get_color_name(avg_color)
+            else:
+                color_name = None
+            break
+
+    return code, color_name
+
+def get_color_name(bgr):
+    """
+    BGR renk değerini temel renge çevirir (ör: kırmızı, mavi, sarı, vs.)
+    """
+    colors = {
+        'kırmızı': (0, 0, 255),
+        'yeşil': (0, 255, 0),
+        'mavi': (255, 0, 0),
+        'sarı': (0, 255, 255),
+        'turuncu': (0, 165, 255),
+        'mor': (255, 0, 255),
+        'siyah': (0, 0, 0),
+        'beyaz': (255, 255, 255),
+        'gri': (128, 128, 128)
+    }
+    min_dist = float('inf')
+    closest_color = 'tanımsız'
+    for name, value in colors.items():
+        dist = sum((int(bgr[i]) - value[i]) ** 2 for i in range(3))
+        if dist < min_dist:
+            min_dist = dist
+            closest_color = name
+    return closest_color
