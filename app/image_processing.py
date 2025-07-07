@@ -52,7 +52,7 @@ def minkowski_distance(vec1, vec2, p):
     return torch.norm(vec1 - vec2, p=p).item()
 
 def hamming_distance(vec1, vec2):
-    return (vec1 != vec2).float().sum().item() / len(vec1)
+    return (~torch.isclose(vec1, vec2, atol=1e-1)).sum().item()
 
 def jaccard_similarity(set1, set2):
     intersection = len(set1.intersection(set2))
